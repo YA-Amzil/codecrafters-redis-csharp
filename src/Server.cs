@@ -22,8 +22,12 @@ class RedisServer
     static readonly object replicaLock = new object();
     static readonly object listLock = new object();
     static readonly object streamLock = new object();
+    static readonly object pubSubLock = new object();
+    static readonly object sortedSetLock = new object();
     static readonly List<Socket> replicaSockets = new List<Socket>();
     static readonly Dictionary<Socket, long> replicaAckOffsets = new Dictionary<Socket, long>();
+    static readonly Dictionary<string, List<Socket>> channelSubscribers = new Dictionary<string, List<Socket>>();
+    static readonly Dictionary<string, Dictionary<string, double>> sortedSets = new Dictionary<string, Dictionary<string, double>>();
     static long masterReplicationOffset = 0;
     static long replicaProcessedOffset = 0;
     static Dictionary<string, Queue<BlockedPopRequest>> blockedPopWaiters = new Dictionary<string, Queue<BlockedPopRequest>>();
@@ -51,14 +55,16 @@ class RedisServer
         public BlockedXReadRequest(string startId) { StartIdExclusive = startId; }
     }
 
-    // ── Per-connection transaction state ─────────────────────────────────────
-    // Each client gets its own instance created in HandleClient.
-    // This means transactions are fully isolated: Client A's MULTI never
-    // affects Client B.
+    // ── Per-connection state ──────────────────────────────────────────────────
+    // CHANGED: Added SubscribedChannels to track which channels this client
+    // has subscribed to. HashSet ensures duplicates don't increase the count.
+    // Added InSubscribedMode to enforce subscribed mode restrictions.
     class ClientState
     {
         public bool InTransaction = false;
         public List<List<string>> QueuedCommands = new List<List<string>>();
+        public HashSet<string> SubscribedChannels = new HashSet<string>();
+        public bool InSubscribedMode = false;
     }
 
     static string GenerateReplicationId()
@@ -69,90 +75,27 @@ class RedisServer
 
     static void LoadRdbFile()
     {
-        if (string.IsNullOrEmpty(configDir) || string.IsNullOrEmpty(configDbfilename))
-            return;
-
+        if (string.IsNullOrEmpty(configDir) || string.IsNullOrEmpty(configDbfilename)) return;
         string rdbPath = Path.Combine(configDir, configDbfilename);
-        if (!File.Exists(rdbPath))
-            return;
-
-        try
-        {
-            byte[] rdbBytes = File.ReadAllBytes(rdbPath);
-            ParseRdbFile(rdbBytes);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error loading RDB file: {ex.Message}");
-        }
+        if (!File.Exists(rdbPath)) return;
+        try { ParseRdbFile(File.ReadAllBytes(rdbPath)); }
+        catch (Exception ex) { Console.WriteLine($"Error loading RDB file: {ex.Message}"); }
     }
 
-    // ── ParseRdbFile ──────────────────────────────────────────────────────────
-    // Key fixes vs original:
-    //   1. Added 0xFB handler (hash table size info) — was missing entirely,
-    //      causing all subsequent key-value reads to be offset by 2 bytes.
-    //   2. 0xFC / 0xFD now use BitConverter (little-endian) and pass the
-    //      parsed expiry DateTime to TryReadKeyValue instead of a bool flag.
     static void ParseRdbFile(byte[] b)
     {
         if (b.Length < 9) return;
         if (b[0] != 'R' || b[1] != 'E' || b[2] != 'D' || b[3] != 'I' || b[4] != 'S') return;
-
-        int pos = 9; // skip "REDIS" + 4-digit version
-
+        int pos = 9;
         while (pos < b.Length)
         {
             byte op = b[pos++];
-
-            if (op == 0xFF) break; // End of file
-
-            if (op == 0xFA) // Auxiliary field: skip name + value
-            {
-                if (!TryReadString(b, ref pos, out _)) return;
-                if (!TryReadString(b, ref pos, out _)) return;
-                continue;
-            }
-
-            if (op == 0xFE) // Select DB: skip size-encoded DB index
-            {
-                if (!TryReadLength(b, ref pos, out _)) return;
-                continue;
-            }
-
-            // FIX 1: 0xFB was missing. It introduces two size-encoded values
-            // (key hash table size, expiry hash table size). Without this handler
-            // the parser treated those bytes as value-type opcodes and lost sync.
-            if (op == 0xFB)
-            {
-                if (!TryReadLength(b, ref pos, out _)) return; // key table size
-                if (!TryReadLength(b, ref pos, out _)) return; // expiry table size
-                continue;
-            }
-
-            // FIX 2: expiry timestamps are little-endian; use BitConverter.
-            if (op == 0xFC) // Expiry in milliseconds (8-byte uint64, little-endian)
-            {
-                if (pos + 8 > b.Length) return;
-                ulong ms = BitConverter.ToUInt64(b, pos); pos += 8;
-                if (pos >= b.Length) return;
-                byte vt = b[pos++];
-                DateTime exp = DateTimeOffset.FromUnixTimeMilliseconds((long)ms).UtcDateTime;
-                TryReadKeyValue(b, ref pos, vt, exp);
-                continue;
-            }
-
-            if (op == 0xFD) // Expiry in seconds (4-byte uint32, little-endian)
-            {
-                if (pos + 4 > b.Length) return;
-                uint s = BitConverter.ToUInt32(b, pos); pos += 4;
-                if (pos >= b.Length) return;
-                byte vt = b[pos++];
-                DateTime exp = DateTimeOffset.FromUnixTimeSeconds(s).UtcDateTime;
-                TryReadKeyValue(b, ref pos, vt, exp);
-                continue;
-            }
-
-            // Regular key-value: op byte IS the value type
+            if (op == 0xFF) break;
+            if (op == 0xFA) { if (!TryReadString(b, ref pos, out _)) return; if (!TryReadString(b, ref pos, out _)) return; continue; }
+            if (op == 0xFE) { if (!TryReadLength(b, ref pos, out _)) return; continue; }
+            if (op == 0xFB) { if (!TryReadLength(b, ref pos, out _)) return; if (!TryReadLength(b, ref pos, out _)) return; continue; }
+            if (op == 0xFC) { if (pos + 8 > b.Length) return; ulong ms = BitConverter.ToUInt64(b, pos); pos += 8; if (pos >= b.Length) return; byte vt = b[pos++]; TryReadKeyValue(b, ref pos, vt, DateTimeOffset.FromUnixTimeMilliseconds((long)ms).UtcDateTime); continue; }
+            if (op == 0xFD) { if (pos + 4 > b.Length) return; uint s = BitConverter.ToUInt32(b, pos); pos += 4; if (pos >= b.Length) return; byte vt = b[pos++]; TryReadKeyValue(b, ref pos, vt, DateTimeOffset.FromUnixTimeSeconds(s).UtcDateTime); continue; }
             TryReadKeyValue(b, ref pos, op, null);
         }
     }
@@ -160,99 +103,33 @@ class RedisServer
     static bool TryReadKeyValue(byte[] b, ref int pos, byte valueType, DateTime? expiry)
     {
         if (!TryReadString(b, ref pos, out string key)) return false;
-
-        if (valueType == 0) // String
-        {
-            if (!TryReadString(b, ref pos, out string value)) return false;
-            store[key] = (value, expiry);
-        }
-        else if (valueType == 1) // List
-        {
-            if (!TryReadLength(b, ref pos, out int len)) return false;
-            List<string> list = new List<string>();
-            for (int i = 0; i < len; i++)
-            {
-                if (!TryReadString(b, ref pos, out string elem)) return false;
-                list.Add(elem);
-            }
-            lock (listLock) { listStore[key] = list; }
-        }
+        if (valueType == 0) { if (!TryReadString(b, ref pos, out string value)) return false; store[key] = (value, expiry); }
+        else if (valueType == 1) { if (!TryReadLength(b, ref pos, out int len)) return false; List<string> list = new List<string>(); for (int i = 0; i < len; i++) { if (!TryReadString(b, ref pos, out string elem)) return false; list.Add(elem); } lock (listLock) { listStore[key] = list; } }
         return true;
     }
 
-    // ── TryReadString ─────────────────────────────────────────────────────────
-    // FIX 3: Integer-encoded strings use prefix 0xC0/0xC1/0xC2 (top 2 bits = 11,
-    // lower 6 bits = sub-type 0/1/2). The old code used 0xFF/0xFE/0xFD which are
-    // RDB file opcodes — completely wrong for string encoding.
-    // Integers are stored in little-endian order.
     static bool TryReadString(byte[] b, ref int pos, out string result)
     {
         result = string.Empty;
         if (pos >= b.Length) return false;
-
-        byte lb = b[pos++];
-        int top = lb & 0xC0;
-
-        if (top == 0x00) // 6-bit length
-        {
-            int len = lb & 0x3F;
-            if (pos + len > b.Length) return false;
-            result = Encoding.UTF8.GetString(b, pos, len); pos += len;
-            return true;
-        }
-
-        if (top == 0x40) // 14-bit length (big-endian)
-        {
-            if (pos >= b.Length) return false;
-            int len = ((lb & 0x3F) << 8) | b[pos++];
-            if (pos + len > b.Length) return false;
-            result = Encoding.UTF8.GetString(b, pos, len); pos += len;
-            return true;
-        }
-
-        if (top == 0x80) // 32-bit length (big-endian, skip first byte)
-        {
-            if (pos + 4 > b.Length) return false;
-            int len = (b[pos] << 24) | (b[pos+1] << 16) | (b[pos+2] << 8) | b[pos+3]; pos += 4;
-            if (pos + len > b.Length) return false;
-            result = Encoding.UTF8.GetString(b, pos, len); pos += len;
-            return true;
-        }
-
-        // top == 0xC0: special integer encoding
+        byte lb = b[pos++]; int top = lb & 0xC0;
+        if (top == 0x00) { int len = lb & 0x3F; if (pos + len > b.Length) return false; result = Encoding.UTF8.GetString(b, pos, len); pos += len; return true; }
+        if (top == 0x40) { if (pos >= b.Length) return false; int len = ((lb & 0x3F) << 8) | b[pos++]; if (pos + len > b.Length) return false; result = Encoding.UTF8.GetString(b, pos, len); pos += len; return true; }
+        if (top == 0x80) { if (pos + 4 > b.Length) return false; int len = (b[pos] << 24) | (b[pos + 1] << 16) | (b[pos + 2] << 8) | b[pos + 3]; pos += 4; if (pos + len > b.Length) return false; result = Encoding.UTF8.GetString(b, pos, len); pos += len; return true; }
         int enc = lb & 0x3F;
-
-        if (enc == 0) // 0xC0: 8-bit unsigned integer
-        {
-            if (pos >= b.Length) return false;
-            result = b[pos++].ToString();
-            return true;
-        }
-        if (enc == 1) // 0xC1: 16-bit little-endian integer
-        {
-            if (pos + 2 > b.Length) return false;
-            result = (b[pos] | (b[pos+1] << 8)).ToString(); pos += 2;
-            return true;
-        }
-        if (enc == 2) // 0xC2: 32-bit little-endian integer
-        {
-            if (pos + 4 > b.Length) return false;
-            result = (b[pos] | (b[pos+1] << 8) | (b[pos+2] << 16) | (b[pos+3] << 24)).ToString(); pos += 4;
-            return true;
-        }
-
-        return false; // 0xC3 = LZF compressed, not needed
+        if (enc == 0) { if (pos >= b.Length) return false; result = b[pos++].ToString(); return true; }
+        if (enc == 1) { if (pos + 2 > b.Length) return false; result = (b[pos] | (b[pos + 1] << 8)).ToString(); pos += 2; return true; }
+        if (enc == 2) { if (pos + 4 > b.Length) return false; result = (b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16) | (b[pos + 3] << 24)).ToString(); pos += 4; return true; }
+        return false;
     }
 
     static bool TryReadLength(byte[] b, ref int pos, out int length)
     {
-        length = 0;
-        if (pos >= b.Length) return false;
-        byte lb = b[pos++];
-        int top = lb & 0xC0;
+        length = 0; if (pos >= b.Length) return false;
+        byte lb = b[pos++]; int top = lb & 0xC0;
         if (top == 0x00) { length = lb & 0x3F; return true; }
         if (top == 0x40) { if (pos >= b.Length) return false; length = ((lb & 0x3F) << 8) | b[pos++]; return true; }
-        if (top == 0x80) { if (pos + 4 > b.Length) return false; length = (b[pos] << 24) | (b[pos+1] << 16) | (b[pos+2] << 8) | b[pos+3]; pos += 4; return true; }
+        if (top == 0x80) { if (pos + 4 > b.Length) return false; length = (b[pos] << 24) | (b[pos + 1] << 16) | (b[pos + 2] << 8) | b[pos + 3]; pos += 4; return true; }
         return false;
     }
 
@@ -276,22 +153,12 @@ class RedisServer
     static string ReadRespLine(NetworkStream stream)
     {
         List<byte> bytes = new List<byte>();
-        while (true)
-        {
-            int b = stream.ReadByte();
-            if (b < 0) throw new IOException("Connection closed");
-            bytes.Add((byte)b);
-            int c = bytes.Count;
-            if (c >= 2 && bytes[c-2] == '\r' && bytes[c-1] == '\n') break;
-        }
+        while (true) { int b = stream.ReadByte(); if (b < 0) throw new IOException("Connection closed"); bytes.Add((byte)b); int c = bytes.Count; if (c >= 2 && bytes[c - 2] == '\r' && bytes[c - 1] == '\n') break; }
         return Encoding.UTF8.GetString(bytes.ToArray(), 0, bytes.Count - 2);
     }
 
     static void ReadExact(NetworkStream stream, byte[] buf, int len)
-    {
-        int read = 0;
-        while (read < len) { int n = stream.Read(buf, read, len - read); if (n <= 0) throw new IOException("Connection closed"); read += n; }
-    }
+    { int read = 0; while (read < len) { int n = stream.Read(buf, read, len - read); if (n <= 0) throw new IOException("Connection closed"); read += n; } }
 
     static void ReceiveFullResyncAndRdb(NetworkStream stream)
     {
@@ -304,28 +171,25 @@ class RedisServer
     }
 
     static int FindCrlf(List<byte> buf, int start)
-    {
-        for (int i = start; i + 1 < buf.Count; i++) if (buf[i] == '\r' && buf[i+1] == '\n') return i;
-        return -1;
-    }
+    { for (int i = start; i + 1 < buf.Count; i++) if (buf[i] == '\r' && buf[i + 1] == '\n') return i; return -1; }
 
     static bool TryParseRespArray(List<byte> buf, out List<string> args, out int consumed)
     {
         args = new List<string>(); consumed = 0;
         if (buf.Count == 0 || buf[0] != '*') return false;
         int le = FindCrlf(buf, 0); if (le < 0) return false;
-        if (!int.TryParse(Encoding.UTF8.GetString(buf.GetRange(1, le-1).ToArray()), out int count) || count < 0) throw new InvalidOperationException("Invalid array length");
+        if (!int.TryParse(Encoding.UTF8.GetString(buf.GetRange(1, le - 1).ToArray()), out int count) || count < 0) throw new InvalidOperationException("Invalid array length");
         int idx = le + 2;
         for (int i = 0; i < count; i++)
         {
             if (idx >= buf.Count || buf[idx] != '$') return false;
             int lle = FindCrlf(buf, idx); if (lle < 0) return false;
-            if (!int.TryParse(Encoding.UTF8.GetString(buf.GetRange(idx+1, lle-(idx+1)).ToArray()), out int len) || len < 0) throw new InvalidOperationException("Invalid bulk length");
+            if (!int.TryParse(Encoding.UTF8.GetString(buf.GetRange(idx + 1, lle - (idx + 1)).ToArray()), out int len) || len < 0) throw new InvalidOperationException("Invalid bulk length");
             idx = lle + 2;
             if (buf.Count < idx + len + 2) return false;
             args.Add(Encoding.UTF8.GetString(buf.GetRange(idx, len).ToArray()));
             idx += len;
-            if (buf[idx] != '\r' || buf[idx+1] != '\n') throw new InvalidOperationException("Invalid RESP terminator");
+            if (buf[idx] != '\r' || buf[idx + 1] != '\n') throw new InvalidOperationException("Invalid RESP terminator");
             idx += 2;
         }
         consumed = idx; return true;
@@ -354,10 +218,26 @@ class RedisServer
     static void RegisterReplica(Socket s) { lock (replicaLock) { if (!replicaSockets.Contains(s)) replicaSockets.Add(s); replicaAckOffsets[s] = 0; } }
     static void UnregisterReplica(Socket s) { lock (replicaLock) { replicaSockets.Remove(s); replicaAckOffsets.Remove(s); } }
 
-    static int CountReplicasAtOrAboveOffset(long offset)
+    static void CleanupClientSubscriptions(Socket client)
     {
-        lock (replicaLock) { int c = 0; foreach (Socket r in replicaSockets) if (replicaAckOffsets.TryGetValue(r, out long a) && a >= offset) c++; return c; }
+        lock (pubSubLock)
+        {
+            // Remove this client from all channel subscriber lists
+            foreach (var kvp in channelSubscribers)
+            {
+                kvp.Value.Remove(client);
+            }
+            // Remove empty channel entries
+            var emptyChannels = channelSubscribers.Where(kvp => kvp.Value.Count == 0).Select(kvp => kvp.Key).ToList();
+            foreach (var channel in emptyChannels)
+            {
+                channelSubscribers.Remove(channel);
+            }
+        }
     }
+
+    static int CountReplicasAtOrAboveOffset(long offset)
+    { lock (replicaLock) { int c = 0; foreach (Socket r in replicaSockets) if (replicaAckOffsets.TryGetValue(r, out long a) && a >= offset) c++; return c; } }
 
     static void SendGetAckToReplicas()
     {
@@ -393,23 +273,15 @@ class RedisServer
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--port" && i + 1 < args.Length) { int.TryParse(args[++i], out port); }
-            else if (args[i] == "--replicaof" && i + 1 < args.Length)
-            {
-                isReplica = true;
-                string[] p = args[++i].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (p.Length >= 2 && int.TryParse(p[1], out int rp)) { replicaHost = p[0]; replicaPort = rp; }
-            }
+            else if (args[i] == "--replicaof" && i + 1 < args.Length) { isReplica = true; string[] p = args[++i].Split(' ', StringSplitOptions.RemoveEmptyEntries); if (p.Length >= 2 && int.TryParse(p[1], out int rp)) { replicaHost = p[0]; replicaPort = rp; } }
             else if (args[i] == "--dir" && i + 1 < args.Length) { configDir = args[++i]; }
             else if (args[i] == "--dbfilename" && i + 1 < args.Length) { configDbfilename = args[++i]; }
         }
-
         LoadRdbFile();
         if (isReplica) ConnectToMaster(replicaHost, replicaPort, port);
-
         TcpListener server = new TcpListener(IPAddress.Any, port);
         server.Start();
         Console.WriteLine($"Redis server started on port {port}...");
-
         while (true)
         {
             try { Socket client = server.AcceptSocket(); Console.WriteLine("Client connected."); new Thread(() => HandleClient(client)).Start(); }
@@ -418,6 +290,11 @@ class RedisServer
         server.Stop();
     }
 
+    // ── HandleClient ─────────────────────────────────────────────────────────
+    // CHANGED: SUBSCRIBE is now handled here directly (not via DispatchCommand)
+    // because it needs access to both the client Socket and ClientState.
+    // For each channel in the arguments we send one response immediately,
+    // then continue the receive loop so further SUBSCRIBE commands work too.
     static void HandleClient(Socket client)
     {
         byte[] buffer = new byte[1024];
@@ -437,8 +314,117 @@ class RedisServer
                 string command = args[0].ToUpperInvariant();
                 string response;
 
+                // Replica ACK — one-way, no reply
                 if (command == "REPLCONF" && args.Count >= 3 && args[1].Equals("ACK", StringComparison.OrdinalIgnoreCase) && long.TryParse(args[2], out long ackOff))
                 { lock (replicaLock) { if (replicaSockets.Contains(client)) replicaAckOffsets[client] = ackOff; } continue; }
+
+                // ── SUBSCRIBE ────────────────────────────────────────────────
+                // Handled here because it needs per-client channel state and
+                // sends one response frame per channel, not one for the whole command.
+                // HashSet.Add() returns false for duplicates → count stays the same.
+                // When subscribing for the first time, enter subscribed mode.
+                if (command == "SUBSCRIBE")
+                {
+                    if (args.Count < 2)
+                    {
+                        client.Send(Encoding.UTF8.GetBytes("-ERR wrong number of arguments for 'SUBSCRIBE'\r\n"));
+                        continue;
+                    }
+
+                    for (int j = 1; j < args.Count; j++)
+                    {
+                        string channel = args[j];
+                        bool wasEmpty = state.SubscribedChannels.Count == 0;
+                        bool isNewSubscription = state.SubscribedChannels.Add(channel); // Returns false if already present
+
+                        // Update global channel subscriber mapping
+                        if (isNewSubscription)
+                        {
+                            lock (pubSubLock)
+                            {
+                                if (!channelSubscribers.ContainsKey(channel))
+                                    channelSubscribers[channel] = new List<Socket>();
+                                if (!channelSubscribers[channel].Contains(client))
+                                    channelSubscribers[channel].Add(client);
+                            }
+                        }
+
+                        if (wasEmpty) state.InSubscribedMode = true; // Enter subscribed mode on first subscription
+                        client.Send(Encoding.UTF8.GetBytes(BuildSubscribeResponse(channel, state.SubscribedChannels.Count)));
+                    }
+                    continue; // skip the generic send below
+                }
+
+                // ── UNSUBSCRIBE ──────────────────────────────────────────────
+                // Remove subscriptions; if no channels left, exit subscribed mode.
+                if (command == "UNSUBSCRIBE")
+                {
+                    StringBuilder sb = new StringBuilder();
+                    if (args.Count == 1) // No channels specified → unsubscribe from all
+                    {
+                        List<string> channels = new List<string>(state.SubscribedChannels);
+                        foreach (string channel in channels)
+                        {
+                            state.SubscribedChannels.Remove(channel);
+                            lock (pubSubLock)
+                            {
+                                if (channelSubscribers.TryGetValue(channel, out List<Socket>? subscribers))
+                                {
+                                    subscribers.Remove(client);
+                                    if (subscribers.Count == 0)
+                                        channelSubscribers.Remove(channel);
+                                }
+                            }
+                            sb.Append(BuildUnsubscribeResponse(channel, state.SubscribedChannels.Count));
+                        }
+                    }
+                    else
+                    {
+                        for (int j = 1; j < args.Count; j++)
+                        {
+                            string channel = args[j];
+                            state.SubscribedChannels.Remove(channel);
+                            lock (pubSubLock)
+                            {
+                                if (channelSubscribers.TryGetValue(channel, out List<Socket>? subscribers))
+                                {
+                                    subscribers.Remove(client);
+                                    if (subscribers.Count == 0)
+                                        channelSubscribers.Remove(channel);
+                                }
+                            }
+                            sb.Append(BuildUnsubscribeResponse(channel, state.SubscribedChannels.Count));
+                        }
+                    }
+                    if (state.SubscribedChannels.Count == 0) state.InSubscribedMode = false;
+                    client.Send(Encoding.UTF8.GetBytes(sb.ToString()));
+                    continue;
+                }
+
+                // ── Subscribed Mode Restrictions ─────────────────────────────────
+                // In subscribed mode, only certain commands are allowed.
+                if (state.InSubscribedMode)
+                {
+                    // Allowed commands: SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING, QUIT, RESET
+                    if (command != "SUBSCRIBE" && command != "UNSUBSCRIBE" &&
+                        command != "PSUBSCRIBE" && command != "PUNSUBSCRIBE" &&
+                        command != "PING" && command != "QUIT" && command != "RESET")
+                    {
+                        response = $"-ERR Can't execute '{command.ToLower()}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n";
+                        client.Send(Encoding.UTF8.GetBytes(response));
+                        continue;
+                    }
+                }
+
+                // ── PING in Subscribed Mode ───────────────────────────────────────
+                // In subscribed mode, PING returns a different format: ["pong", ""]
+                // instead of the normal +PONG\r\n
+                if (command == "PING" && state.InSubscribedMode)
+                {
+                    response = "*2\r\n$4\r\npong\r\n$0\r\n\r\n";
+                    client.Send(Encoding.UTF8.GetBytes(response));
+                    continue;
+                }
 
                 if (command == "MULTI")
                 {
@@ -458,12 +444,7 @@ class RedisServer
                     {
                         response = HandlePSync(args);
                         SendAll(client, Encoding.UTF8.GetBytes(response));
-                        if (response.StartsWith("+FULLRESYNC"))
-                        {
-                            SendAll(client, Encoding.ASCII.GetBytes($"${EmptyRdbBytes.Length}\r\n"));
-                            SendAll(client, EmptyRdbBytes);
-                            RegisterReplica(client);
-                        }
+                        if (response.StartsWith("+FULLRESYNC")) { SendAll(client, Encoding.ASCII.GetBytes($"${EmptyRdbBytes.Length}\r\n")); SendAll(client, EmptyRdbBytes); RegisterReplica(client); }
                         continue;
                     }
                     response = DispatchCommand(command, args);
@@ -475,8 +456,48 @@ class RedisServer
             catch (SocketException) { Console.WriteLine("Client connection lost."); break; }
             catch (Exception ex) { Console.WriteLine($"Client error: {ex.Message}"); break; }
         }
+        CleanupClientSubscriptions(client);
         UnregisterReplica(client);
         client.Close();
+    }
+
+    // ── BuildSubscribeResponse ────────────────────────────────────────────────
+    // Builds the 3-element RESP array for one SUBSCRIBE confirmation.
+    // Format: ["subscribe", <channel>, <total subscribed count for this client>]
+    static string BuildSubscribeResponse(string channel, int count)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*3\r\n");
+        sb.Append("$9\r\nsubscribe\r\n");
+        sb.Append($"${channel.Length}\r\n{channel}\r\n");
+        sb.Append($":{count}\r\n");
+        return sb.ToString();
+    }
+
+    // ── BuildUnsubscribeResponse ──────────────────────────────────────────────
+    // Builds the 3-element RESP array for one UNSUBSCRIBE confirmation.
+    // Format: ["unsubscribe", <channel>, <total subscribed count for this client>]
+    static string BuildUnsubscribeResponse(string channel, int count)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*3\r\n");
+        sb.Append("$11\r\nunsubscribe\r\n");
+        sb.Append($"${channel.Length}\r\n{channel}\r\n");
+        sb.Append($":{count}\r\n");
+        return sb.ToString();
+    }
+
+    // ── BuildMessageResponse ──────────────────────────────────────────────────
+    // Builds the 3-element RESP array for a published message.
+    // Format: ["message", <channel>, <message_contents>]
+    static string BuildMessageResponse(string channel, string message)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*3\r\n");
+        sb.Append("$7\r\nmessage\r\n");
+        sb.Append($"${channel.Length}\r\n{channel}\r\n");
+        sb.Append($"${message.Length}\r\n{message}\r\n");
+        return sb.ToString();
     }
 
     static string HandleExec(ClientState state)
@@ -489,32 +510,42 @@ class RedisServer
         return sb.ToString();
     }
 
+    // ── DispatchCommand ───────────────────────────────────────────────────────
+    // CHANGED: SUBSCRIBE removed — it now lives in HandleClient where it has
+    // access to per-client state and can send multiple response frames.
     static string DispatchCommand(string command, List<string> args)
     {
         switch (command)
         {
-            case "PING":     return "+PONG\r\n";
-            case "ECHO":     return args.Count > 1 ? $"${args[1].Length}\r\n{args[1]}\r\n" : "$-1\r\n";
+            case "PING": return "+PONG\r\n";
+            case "ECHO": return args.Count > 1 ? $"${args[1].Length}\r\n{args[1]}\r\n" : "$-1\r\n";
             case "REPLCONF": return "+OK\r\n";
-            case "PSYNC":    return HandlePSync(args);
-            case "WAIT":     return HandleWait(args);
-            case "CONFIG":   return HandleConfig(args);
-            case "KEYS":     return HandleKeys(args);
-            case "SET":      return HandleSet(args);
-            case "GET":      return HandleGet(args);
-            case "INFO":     return HandleInfo(args);
-            case "INCR":     return HandleIncr(args);
-            case "RPUSH":    return HandleRPush(args);
-            case "LPUSH":    return HandleLPush(args);
-            case "LRANGE":   return HandleLRange(args);
-            case "LLEN":     return HandleLLen(args);
-            case "LPOP":     return HandleLPop(args);
-            case "BLPOP":    return HandleBLPop(args);
-            case "TYPE":     return HandleType(args);
-            case "XADD":     return HandleXAdd(args);
-            case "XRANGE":   return HandleXRange(args);
-            case "XREAD":    return HandleXRead(args);
-            default:         return "-ERR unknown command\r\n";
+            case "PSYNC": return HandlePSync(args);
+            case "WAIT": return HandleWait(args);
+            case "CONFIG": return HandleConfig(args);
+            case "KEYS": return HandleKeys(args);
+            case "SET": return HandleSet(args);
+            case "GET": return HandleGet(args);
+            case "INFO": return HandleInfo(args);
+            case "INCR": return HandleIncr(args);
+            case "RPUSH": return HandleRPush(args);
+            case "LPUSH": return HandleLPush(args);
+            case "LRANGE": return HandleLRange(args);
+            case "LLEN": return HandleLLen(args);
+            case "LPOP": return HandleLPop(args);
+            case "BLPOP": return HandleBLPop(args);
+            case "TYPE": return HandleType(args);
+            case "XADD": return HandleXAdd(args);
+            case "XRANGE": return HandleXRange(args);
+            case "XREAD": return HandleXRead(args);
+            case "PUBLISH": return HandlePublish(args);
+            case "ZADD": return HandleZAdd(args);
+            case "ZRANK": return HandleZRank(args);
+            case "ZSCORE": return HandleZScore(args);
+            case "ZRANGE": return HandleZRange(args);
+            case "ZCARD": return HandleZCard(args);
+            case "ZREM": return HandleZRem(args);
+            default: return "-ERR unknown command\r\n";
         }
     }
 
@@ -523,9 +554,8 @@ class RedisServer
         if (args.Count < 3) return "-ERR wrong number of arguments for 'SET'\r\n";
         string key = args[1], value = args[2]; DateTime? expiry = null;
         for (int i = 3; i < args.Count - 1; i++)
-            if (args[i].Equals("PX", StringComparison.OrdinalIgnoreCase) && int.TryParse(args[i+1], out int ms)) { expiry = DateTime.UtcNow.AddMilliseconds(ms); i++; }
-        store[key] = (value, expiry);
-        return "+OK\r\n";
+            if (args[i].Equals("PX", StringComparison.OrdinalIgnoreCase) && int.TryParse(args[i + 1], out int ms)) { expiry = DateTime.UtcNow.AddMilliseconds(ms); i++; }
+        store[key] = (value, expiry); return "+OK\r\n";
     }
 
     static string HandleGet(List<string> args)
@@ -538,22 +568,14 @@ class RedisServer
     static string HandleInfo(List<string> args)
     {
         if (args.Count >= 2 && args[1].Equals("replication", StringComparison.OrdinalIgnoreCase))
-        {
-            string body = $"role:{(isReplica ? "slave" : "master")}\r\nmaster_replid:{masterReplId}\r\nmaster_repl_offset:{masterReplOffset}";
-            return $"${body.Length}\r\n{body}\r\n";
-        }
+        { string body = $"role:{(isReplica ? "slave" : "master")}\r\nmaster_replid:{masterReplId}\r\nmaster_repl_offset:{masterReplOffset}"; return $"${body.Length}\r\n{body}\r\n"; }
         return "$0\r\n\r\n";
     }
 
     static string HandleConfig(List<string> args)
     {
         if (args.Count >= 3 && args[1].Equals("GET", StringComparison.OrdinalIgnoreCase))
-        {
-            string p = args[2].ToLowerInvariant();
-            if (p == "dir") return $"*2\r\n$3\r\ndir\r\n${configDir.Length}\r\n{configDir}\r\n";
-            if (p == "dbfilename") return $"*2\r\n$10\r\ndbfilename\r\n${configDbfilename.Length}\r\n{configDbfilename}\r\n";
-            return "*0\r\n";
-        }
+        { string p = args[2].ToLowerInvariant(); if (p == "dir") return $"*2\r\n$3\r\ndir\r\n${configDir.Length}\r\n{configDir}\r\n"; if (p == "dbfilename") return $"*2\r\n$10\r\ndbfilename\r\n${configDbfilename.Length}\r\n{configDbfilename}\r\n"; return "*0\r\n"; }
         return "-ERR Unknown subcommand\r\n";
     }
 
@@ -565,6 +587,7 @@ class RedisServer
         foreach (var kvp in store) { var (_, ex) = kvp.Value; if (!ex.HasValue || DateTime.UtcNow <= ex.Value) keys.Add(kvp.Key); }
         lock (listLock) foreach (string k in listStore.Keys) if (!keys.Contains(k)) keys.Add(k);
         lock (streamLock) foreach (string k in streamStore.Keys) if (!keys.Contains(k)) keys.Add(k);
+        lock (sortedSetLock) foreach (string k in sortedSets.Keys) if (!keys.Contains(k)) keys.Add(k);
         StringBuilder sb = new StringBuilder(); sb.Append($"*{keys.Count}\r\n"); foreach (string k in keys) sb.Append($"${k.Length}\r\n{k}\r\n");
         return sb.ToString();
     }
@@ -593,13 +616,234 @@ class RedisServer
     {
         if (args.Count != 2) return "-ERR wrong number of arguments for 'INCR'\r\n";
         string key = args[1];
-        if (store.TryGetValue(key, out var entry))
-        {
-            if (entry.expiry.HasValue && DateTime.UtcNow > entry.expiry.Value) { store[key] = ("1", null); return ":1\r\n"; }
-            if (!long.TryParse(entry.value, out long cur)) return "-ERR value is not an integer or out of range\r\n";
-            store[key] = ((cur+1).ToString(), entry.expiry); return $":{cur+1}\r\n";
-        }
+        if (store.TryGetValue(key, out var entry)) { if (entry.expiry.HasValue && DateTime.UtcNow > entry.expiry.Value) { store[key] = ("1", null); return ":1\r\n"; } if (!long.TryParse(entry.value, out long cur)) return "-ERR value is not an integer or out of range\r\n"; store[key] = ((cur + 1).ToString(), entry.expiry); return $":{cur + 1}\r\n"; }
         store[key] = ("1", null); return ":1\r\n";
+    }
+
+    static string HandlePublish(List<string> args)
+    {
+        if (args.Count < 3) return "-ERR wrong number of arguments for 'PUBLISH'\r\n";
+        string channel = args[1];
+        string message = args[2];
+        int subscriberCount = 0;
+        List<Socket> subscribers = new List<Socket>();
+
+        lock (pubSubLock)
+        {
+            if (channelSubscribers.TryGetValue(channel, out List<Socket>? subs))
+            {
+                subscriberCount = subs.Count;
+                subscribers.AddRange(subs); // Copy the list to avoid lock contention
+            }
+        }
+
+        // Deliver message to each subscriber
+        string messageResponse = BuildMessageResponse(channel, message);
+        byte[] messageBytes = Encoding.UTF8.GetBytes(messageResponse);
+
+        foreach (Socket subscriber in subscribers)
+        {
+            try
+            {
+                subscriber.Send(messageBytes);
+            }
+            catch (Exception ex)
+            {
+                // If sending fails, the client will be cleaned up when it disconnects
+                Console.WriteLine($"Failed to deliver message to subscriber: {ex.Message}");
+            }
+        }
+
+        return $":{subscriberCount}\r\n";
+    }
+
+    static string HandleZAdd(List<string> args)
+    {
+        // ZADD key score member [score member ...]
+        if (args.Count < 4 || (args.Count % 2) != 0)
+            return "-ERR wrong number of arguments for 'ZADD'\r\n";
+
+        string key = args[1];
+        int newMembersAdded = 0;
+
+        lock (sortedSetLock)
+        {
+            if (!sortedSets.ContainsKey(key))
+                sortedSets[key] = new Dictionary<string, double>();
+
+            var members = sortedSets[key];
+
+            // Process pairs of (score, member)
+            for (int i = 2; i < args.Count; i += 2)
+            {
+                if (!double.TryParse(args[i], NumberStyles.Float, CultureInfo.InvariantCulture, out double score))
+                    return "-ERR value is not a valid float\r\n";
+
+                string member = args[i + 1];
+
+                // Only count if it's a new member (not already in the set)
+                if (!members.ContainsKey(member))
+                    newMembersAdded++;
+
+                members[member] = score;
+            }
+        }
+
+        return $":{newMembersAdded}\r\n";
+    }
+
+    static string HandleZRank(List<string> args)
+    {
+        if (args.Count != 3) return "-ERR wrong number of arguments for 'ZRANK'\r\n";
+
+        string key = args[1];
+        string member = args[2];
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+                return "$-1\r\n";
+
+            // Check if member exists
+            if (!members.ContainsKey(member))
+                return "$-1\r\n";
+
+            // Get all members sorted by (score ascending, then member name lexicographically)
+            var sortedMembers = members
+                .OrderBy(kvp => kvp.Value)  // Sort by score ascending
+                .ThenBy(kvp => kvp.Key)     // Then by member name lexicographically
+                .ToList();
+
+            // Find the rank (0-based index)
+            for (int i = 0; i < sortedMembers.Count; i++)
+            {
+                if (sortedMembers[i].Key == member)
+                    return $":{i}\r\n";
+            }
+        }
+
+        return "$-1\r\n";
+    }
+
+    static string HandleZScore(List<string> args)
+    {
+        if (args.Count != 3) return "-ERR wrong number of arguments for 'ZSCORE'\r\n";
+
+        string key = args[1];
+        string member = args[2];
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+                return "$-1\r\n";
+
+            // Check if member exists in the set
+            if (!members.TryGetValue(member, out double score))
+                return "$-1\r\n";
+
+            // Return the score as a RESP bulk string
+            string scoreStr = score.ToString("G", CultureInfo.InvariantCulture);
+            return $"${scoreStr.Length}\r\n{scoreStr}\r\n";
+        }
+    }
+
+    static string HandleZCard(List<string> args)
+    {
+        if (args.Count != 2) return "-ERR wrong number of arguments for 'ZCARD'\r\n";
+
+        string key = args[1];
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists and return count, or 0 if doesn't exist
+            if (sortedSets.TryGetValue(key, out var members))
+                return $":{members.Count}\r\n";
+            else
+                return ":0\r\n";
+        }
+    }
+
+    static string HandleZRange(List<string> args)
+    {
+        if (args.Count != 4) return "-ERR wrong number of arguments for 'ZRANGE'\r\n";
+
+        string key = args[1];
+        if (!int.TryParse(args[2], out int start) || !int.TryParse(args[3], out int stop))
+            return "-ERR value is not an integer or out of range\r\n";
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+                return "*0\r\n";
+
+            int count = members.Count;
+
+            // Normalize negative indexes
+            if (start < 0) start = count + start;
+            if (stop < 0) stop = count + stop;
+
+            // Clamp to valid range
+            if (start < 0) start = 0;
+            if (stop < 0) stop = 0;
+
+            // Check boundary conditions
+            if (start >= count || start > stop)
+                return "*0\r\n";
+
+            // Clamp stop to count-1
+            stop = Math.Min(stop, count - 1);
+
+            // Get all members sorted by (score ascending, then member name lexicographically)
+            var sortedMembers = members
+                .OrderBy(kvp => kvp.Value)  // Sort by score ascending
+                .ThenBy(kvp => kvp.Key)     // Then by member name lexicographically
+                .ToList();
+
+            // Build response
+            int responseCount = stop - start + 1;
+            StringBuilder sb = new StringBuilder();
+            sb.Append($"*{responseCount}\r\n");
+
+            for (int i = start; i <= stop; i++)
+            {
+                string member = sortedMembers[i].Key;
+                sb.Append($"${member.Length}\r\n{member}\r\n");
+            }
+
+            return sb.ToString();
+        }
+    }
+
+    static string HandleZRem(List<string> args)
+    {
+        // ZREM key member [member ...]
+        if (args.Count < 3) return "-ERR wrong number of arguments for 'ZREM'\r\n";
+
+        string key = args[1];
+        int removedCount = 0;
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+                return ":0\r\n";
+
+            // Remove each specified member
+            for (int i = 2; i < args.Count; i++)
+            {
+                if (members.Remove(args[i]))
+                    removedCount++;
+            }
+
+            // If the set is now empty, remove the key entirely
+            if (members.Count == 0)
+                sortedSets.Remove(key);
+        }
+
+        return $":{removedCount}\r\n";
     }
 
     static string HandleRPush(List<string> args)
@@ -624,17 +868,13 @@ class RedisServer
         int cnt = snap.Count;
         if (start < 0) start = cnt + start; if (stop < 0) stop = cnt + stop; if (start < 0) start = 0; if (stop < 0) stop = 0;
         if (start >= cnt || start > stop) return "*0\r\n";
-        int end = Math.Min(stop, cnt-1); StringBuilder sb = new StringBuilder(); sb.Append($"*{end-start+1}\r\n");
+        int end = Math.Min(stop, cnt - 1); StringBuilder sb = new StringBuilder(); sb.Append($"*{end - start + 1}\r\n");
         for (int i = start; i <= end; i++) sb.Append($"${snap[i].Length}\r\n{snap[i]}\r\n");
         return sb.ToString();
     }
 
     static string HandleLLen(List<string> args)
-    {
-        if (args.Count != 2) return "-ERR wrong number of arguments for 'LLEN'\r\n";
-        int len; lock (listLock) { len = listStore.TryGetValue(args[1], out List<string>? l) ? l.Count : 0; }
-        return $":{len}\r\n";
-    }
+    { if (args.Count != 2) return "-ERR wrong number of arguments for 'LLEN'\r\n"; int len; lock (listLock) { len = listStore.TryGetValue(args[1], out List<string>? l) ? l.Count : 0; } return $":{len}\r\n"; }
 
     static string HandleLPop(List<string> args)
     {
@@ -642,13 +882,7 @@ class RedisServer
         string key = args[1];
         if (args.Count == 2) { lock (listLock) { if (!listStore.TryGetValue(key, out List<string>? sl) || sl.Count == 0) return "$-1\r\n"; string v = sl[0]; sl.RemoveAt(0); return $"${v.Length}\r\n{v}\r\n"; } }
         if (!int.TryParse(args[2], out int cnt)) return "-ERR value is not an integer or out of range\r\n";
-        lock (listLock)
-        {
-            if (cnt <= 0 || !listStore.TryGetValue(key, out List<string>? list) || list.Count == 0) return "*0\r\n";
-            int n = Math.Min(cnt, list.Count); StringBuilder sb = new StringBuilder(); sb.Append($"*{n}\r\n");
-            for (int i = 0; i < n; i++) { string v = list[0]; list.RemoveAt(0); sb.Append($"${v.Length}\r\n{v}\r\n"); }
-            return sb.ToString();
-        }
+        lock (listLock) { if (cnt <= 0 || !listStore.TryGetValue(key, out List<string>? list) || list.Count == 0) return "*0\r\n"; int n = Math.Min(cnt, list.Count); StringBuilder sb = new StringBuilder(); sb.Append($"*{n}\r\n"); for (int i = 0; i < n; i++) { string v = list[0]; list.RemoveAt(0); sb.Append($"${v.Length}\r\n{v}\r\n"); } return sb.ToString(); }
     }
 
     static string HandleBLPop(List<string> args)
@@ -657,12 +891,7 @@ class RedisServer
         string key = args[1];
         if (!double.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out double timeout) || timeout < 0) return "-ERR timeout is not a float or out of range\r\n";
         BlockedPopRequest req = new BlockedPopRequest();
-        lock (listLock)
-        {
-            if (listStore.TryGetValue(key, out List<string>? list) && list.Count > 0) { string v = list[0]; list.RemoveAt(0); return EncodeKeyValueArray(key, v); }
-            if (!blockedPopWaiters.ContainsKey(key)) blockedPopWaiters[key] = new Queue<BlockedPopRequest>();
-            blockedPopWaiters[key].Enqueue(req);
-        }
+        lock (listLock) { if (listStore.TryGetValue(key, out List<string>? list) && list.Count > 0) { string v = list[0]; list.RemoveAt(0); return EncodeKeyValueArray(key, v); } if (!blockedPopWaiters.ContainsKey(key)) blockedPopWaiters[key] = new Queue<BlockedPopRequest>(); blockedPopWaiters[key].Enqueue(req); }
         bool sig = timeout == 0 ? req.Signal.WaitOne() : req.Signal.WaitOne(TimeSpan.FromSeconds(timeout));
         if (sig) return EncodeKeyValueArray(key, req.Value ?? string.Empty);
         lock (listLock) { if (req.IsCompleted) return EncodeKeyValueArray(key, req.Value ?? string.Empty); RemoveBlockedRequest(key, req); }
@@ -676,6 +905,7 @@ class RedisServer
         if (store.ContainsKey(key)) { var (_, ex) = store[key]; if (ex.HasValue && DateTime.UtcNow > ex.Value) { store.Remove(key); return "+none\r\n"; } return "+string\r\n"; }
         lock (listLock) { if (listStore.ContainsKey(key)) return "+list\r\n"; }
         lock (streamLock) { if (streamStore.ContainsKey(key)) return "+stream\r\n"; }
+        lock (sortedSetLock) { if (sortedSets.ContainsKey(key)) return "+zset\r\n"; }
         return "+none\r\n";
     }
 
@@ -685,44 +915,11 @@ class RedisServer
         string key = args[1], id = args[2], finalId = id;
         lock (listLock) { if (listStore.ContainsKey(key)) return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"; }
         if (store.ContainsKey(key)) return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
-        if (id == "*")
-        {
-            lock (streamLock)
-            {
-                if (!streamStore.TryGetValue(key, out List<StreamEntry>? entries)) { entries = new List<StreamEntry>(); streamStore[key] = entries; }
-                ulong ms = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), seq = 0;
-                if (entries.Count > 0) { string[] lp = entries[^1].Id.Split('-'); ulong lms = ulong.Parse(lp[0]), lseq = ulong.Parse(lp[1]); if (ms <= lms) { ms = lms; seq = lseq+1; } }
-                finalId = $"{ms}-{seq}"; StreamEntry e = new StreamEntry { Id = finalId };
-                for (int i = 3; i < args.Count; i += 2) e.Fields.Add(new KeyValuePair<string, string>(args[i], args[i+1]));
-                entries.Add(e); ServeBlockedXReadClients(key, entries);
-            }
-            return $"${finalId.Length}\r\n{finalId}\r\n";
-        }
-        if (id.EndsWith("-*"))
-        {
-            if (!ulong.TryParse(id.Substring(0, id.Length-2), out ulong ms)) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
-            lock (streamLock)
-            {
-                if (!streamStore.TryGetValue(key, out List<StreamEntry>? entries)) { entries = new List<StreamEntry>(); streamStore[key] = entries; }
-                ulong seq = 0;
-                if (entries.Count > 0) { string[] lp = entries[^1].Id.Split('-'); ulong lms = ulong.Parse(lp[0]), lseq = ulong.Parse(lp[1]); if (ms < lms) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"; seq = ms == lms ? lseq+1 : (ulong)(ms == 0 ? 1 : 0); }
-                else seq = (ulong)(ms == 0 ? 1 : 0);
-                finalId = $"{ms}-{seq}"; StreamEntry e = new StreamEntry { Id = finalId };
-                for (int i = 3; i < args.Count; i += 2) e.Fields.Add(new KeyValuePair<string, string>(args[i], args[i+1]));
-                entries.Add(e); ServeBlockedXReadClients(key, entries);
-            }
-            return $"${finalId.Length}\r\n{finalId}\r\n";
-        }
+        if (id == "*") { lock (streamLock) { if (!streamStore.TryGetValue(key, out List<StreamEntry>? entries)) { entries = new List<StreamEntry>(); streamStore[key] = entries; } ulong ms = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), seq = 0; if (entries.Count > 0) { string[] lp = entries[^1].Id.Split('-'); ulong lms = ulong.Parse(lp[0]), lseq = ulong.Parse(lp[1]); if (ms <= lms) { ms = lms; seq = lseq + 1; } } finalId = $"{ms}-{seq}"; StreamEntry e = new StreamEntry { Id = finalId }; for (int i = 3; i < args.Count; i += 2) e.Fields.Add(new KeyValuePair<string, string>(args[i], args[i + 1])); entries.Add(e); ServeBlockedXReadClients(key, entries); } return $"${finalId.Length}\r\n{finalId}\r\n"; }
+        if (id.EndsWith("-*")) { if (!ulong.TryParse(id.Substring(0, id.Length - 2), out ulong ms)) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"; lock (streamLock) { if (!streamStore.TryGetValue(key, out List<StreamEntry>? entries)) { entries = new List<StreamEntry>(); streamStore[key] = entries; } ulong seq = 0; if (entries.Count > 0) { string[] lp = entries[^1].Id.Split('-'); ulong lms = ulong.Parse(lp[0]), lseq = ulong.Parse(lp[1]); if (ms < lms) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"; seq = ms == lms ? lseq + 1 : (ulong)(ms == 0 ? 1 : 0); } else seq = (ulong)(ms == 0 ? 1 : 0); finalId = $"{ms}-{seq}"; StreamEntry e = new StreamEntry { Id = finalId }; for (int i = 3; i < args.Count; i += 2) e.Fields.Add(new KeyValuePair<string, string>(args[i], args[i + 1])); entries.Add(e); ServeBlockedXReadClients(key, entries); } return $"${finalId.Length}\r\n{finalId}\r\n"; }
         if (!TryParseExplicitStreamId(id, out ulong ems, out ulong eseq)) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
         if (ems == 0 && eseq == 0) return "-ERR The ID specified in XADD must be greater than 0-0\r\n";
-        lock (streamLock)
-        {
-            if (!streamStore.TryGetValue(key, out List<StreamEntry>? entries)) { entries = new List<StreamEntry>(); streamStore[key] = entries; }
-            if (entries.Count > 0 && CompareStreamIds(finalId, entries[^1].Id) <= 0) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
-            StreamEntry e = new StreamEntry { Id = finalId };
-            for (int i = 3; i < args.Count; i += 2) e.Fields.Add(new KeyValuePair<string, string>(args[i], args[i+1]));
-            entries.Add(e); ServeBlockedXReadClients(key, entries);
-        }
+        lock (streamLock) { if (!streamStore.TryGetValue(key, out List<StreamEntry>? entries)) { entries = new List<StreamEntry>(); streamStore[key] = entries; } if (entries.Count > 0 && CompareStreamIds(finalId, entries[^1].Id) <= 0) return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"; StreamEntry e = new StreamEntry { Id = finalId }; for (int i = 3; i < args.Count; i += 2) e.Fields.Add(new KeyValuePair<string, string>(args[i], args[i + 1])); entries.Add(e); ServeBlockedXReadClients(key, entries); }
         return $"${finalId.Length}\r\n{finalId}\r\n";
     }
 
@@ -730,15 +927,7 @@ class RedisServer
     {
         if (args.Count != 4) return "-ERR wrong number of arguments for 'XRANGE'\r\n";
         if (!TryParseStreamRangeBound(args[2], true, out string startId) || !TryParseStreamRangeBound(args[3], false, out string endId)) return "-ERR Invalid stream ID specified as range\r\n";
-        lock (streamLock)
-        {
-            if (!streamStore.TryGetValue(args[1], out List<StreamEntry>? entries) || entries.Count == 0) return "*0\r\n";
-            List<StreamEntry> match = entries.FindAll(e => CompareStreamIds(e.Id, startId) >= 0 && CompareStreamIds(e.Id, endId) <= 0);
-            if (match.Count == 0) return "*0\r\n";
-            StringBuilder sb = new StringBuilder(); sb.Append($"*{match.Count}\r\n");
-            foreach (StreamEntry e in match) { sb.Append("*2\r\n"); sb.Append($"${e.Id.Length}\r\n{e.Id}\r\n"); sb.Append($"*{e.Fields.Count * 2}\r\n"); foreach (var f in e.Fields) { sb.Append($"${f.Key.Length}\r\n{f.Key}\r\n"); sb.Append($"${f.Value.Length}\r\n{f.Value}\r\n"); } }
-            return sb.ToString();
-        }
+        lock (streamLock) { if (!streamStore.TryGetValue(args[1], out List<StreamEntry>? entries) || entries.Count == 0) return "*0\r\n"; List<StreamEntry> match = entries.FindAll(e => CompareStreamIds(e.Id, startId) >= 0 && CompareStreamIds(e.Id, endId) <= 0); if (match.Count == 0) return "*0\r\n"; StringBuilder sb = new StringBuilder(); sb.Append($"*{match.Count}\r\n"); foreach (StreamEntry e in match) { sb.Append("*2\r\n"); sb.Append($"${e.Id.Length}\r\n{e.Id}\r\n"); sb.Append($"*{e.Fields.Count * 2}\r\n"); foreach (var f in e.Fields) { sb.Append($"${f.Key.Length}\r\n{f.Key}\r\n"); sb.Append($"${f.Value.Length}\r\n{f.Value}\r\n"); } } return sb.ToString(); }
     }
 
     static string HandleXRead(List<string> args)
@@ -747,23 +936,16 @@ class RedisServer
         bool isBlocking = false; int timeoutMs = 0; int si = 1;
         if (args[1].Equals("BLOCK", StringComparison.OrdinalIgnoreCase)) { if (args.Count < 5 || !int.TryParse(args[2], out timeoutMs) || timeoutMs < 0) return "-ERR timeout is not an integer or out of range\r\n"; isBlocking = true; si = 3; }
         if (!args[si].Equals("STREAMS", StringComparison.OrdinalIgnoreCase)) return "-ERR syntax error\r\n";
-        int tac = args.Count - (si+1); if (tac % 2 != 0) return "-ERR syntax error\r\n";
+        int tac = args.Count - (si + 1); if (tac % 2 != 0) return "-ERR syntax error\r\n";
         int sc = tac / 2; if (sc == 0) return "-ERR wrong number of arguments for 'XREAD'\r\n";
         List<string> keys = new List<string>(sc), sids = new List<string>(sc), rawIds = new List<string>(sc);
-        for (int i = 0; i < sc; i++) keys.Add(args[si+1+i]);
-        for (int i = 0; i < sc; i++) rawIds.Add(args[si+1+sc+i]);
+        for (int i = 0; i < sc; i++) keys.Add(args[si + 1 + i]);
+        for (int i = 0; i < sc; i++) rawIds.Add(args[si + 1 + sc + i]);
         bool hasDollar = rawIds.Exists(id => id == "$");
         if (!hasDollar) { for (int i = 0; i < sc; i++) { if (!TryParseXReadId(rawIds[i], out string sid)) return "-ERR Invalid stream ID specified as stream command argument\r\n"; sids.Add(sid); } string imm = BuildXReadResponse(keys, sids, sc); if (imm != "*0\r\n") return imm; }
         if (!isBlocking) return "*0\r\n";
         string bk = keys[0]; BlockedXReadRequest req;
-        lock (streamLock)
-        {
-            if (hasDollar) { sids.Clear(); for (int i = 0; i < sc; i++) { if (rawIds[i] == "$") { string lid = "0-0"; if (streamStore.TryGetValue(keys[i], out List<StreamEntry>? ex) && ex.Count > 0) lid = ex[^1].Id; sids.Add(lid); } else { if (!TryParseXReadId(rawIds[i], out string p2)) return "-ERR Invalid stream ID specified as stream command argument\r\n"; sids.Add(p2); } } }
-            else { string rc = BuildXReadResponse(keys, sids, sc); if (rc != "*0\r\n") return rc; }
-            req = new BlockedXReadRequest(sids[0]);
-            if (!blockedXReadWaiters.ContainsKey(bk)) blockedXReadWaiters[bk] = new List<BlockedXReadRequest>();
-            blockedXReadWaiters[bk].Add(req);
-        }
+        lock (streamLock) { if (hasDollar) { sids.Clear(); for (int i = 0; i < sc; i++) { if (rawIds[i] == "$") { string lid = "0-0"; if (streamStore.TryGetValue(keys[i], out List<StreamEntry>? ex) && ex.Count > 0) lid = ex[^1].Id; sids.Add(lid); } else { if (!TryParseXReadId(rawIds[i], out string p2)) return "-ERR Invalid stream ID specified as stream command argument\r\n"; sids.Add(p2); } } } else { string rc = BuildXReadResponse(keys, sids, sc); if (rc != "*0\r\n") return rc; } req = new BlockedXReadRequest(sids[0]); if (!blockedXReadWaiters.ContainsKey(bk)) blockedXReadWaiters[bk] = new List<BlockedXReadRequest>(); blockedXReadWaiters[bk].Add(req); }
         bool sig = timeoutMs == 0 ? req.Signal.WaitOne() : req.Signal.WaitOne(timeoutMs);
         if (!sig) { lock (streamLock) { if (!req.IsCompleted && blockedXReadWaiters.TryGetValue(bk, out List<BlockedXReadRequest>? wl)) { wl.Remove(req); if (wl.Count == 0) blockedXReadWaiters.Remove(bk); } } if (!req.IsCompleted) return "*-1\r\n"; }
         if (req.NewEntries == null || req.NewEntries.Count == 0) return "*-1\r\n";
@@ -772,15 +954,7 @@ class RedisServer
 
     static string BuildXReadResponse(List<string> keys, List<string> startIds, int sc)
     {
-        lock (streamLock)
-        {
-            List<(string, List<StreamEntry>)> res = new List<(string, List<StreamEntry>)>();
-            for (int i = 0; i < sc; i++) { if (!streamStore.TryGetValue(keys[i], out List<StreamEntry>? se) || se.Count == 0) continue; List<StreamEntry> m = se.FindAll(e => CompareStreamIds(e.Id, startIds[i]) > 0); if (m.Count > 0) res.Add((keys[i], m)); }
-            if (res.Count == 0) return "*0\r\n";
-            StringBuilder sb = new StringBuilder(); sb.Append($"*{res.Count}\r\n");
-            foreach ((string k, List<StreamEntry> ents) in res) { sb.Append("*2\r\n"); sb.Append($"${k.Length}\r\n{k}\r\n"); sb.Append($"*{ents.Count}\r\n"); foreach (StreamEntry e in ents) { sb.Append("*2\r\n"); sb.Append($"${e.Id.Length}\r\n{e.Id}\r\n"); sb.Append($"*{e.Fields.Count * 2}\r\n"); foreach (var f in e.Fields) { sb.Append($"${f.Key.Length}\r\n{f.Key}\r\n"); sb.Append($"${f.Value.Length}\r\n{f.Value}\r\n"); } } }
-            return sb.ToString();
-        }
+        lock (streamLock) { List<(string, List<StreamEntry>)> res = new List<(string, List<StreamEntry>)>(); for (int i = 0; i < sc; i++) { if (!streamStore.TryGetValue(keys[i], out List<StreamEntry>? se) || se.Count == 0) continue; List<StreamEntry> m = se.FindAll(e => CompareStreamIds(e.Id, startIds[i]) > 0); if (m.Count > 0) res.Add((keys[i], m)); } if (res.Count == 0) return "*0\r\n"; StringBuilder sb = new StringBuilder(); sb.Append($"*{res.Count}\r\n"); foreach ((string k, List<StreamEntry> ents) in res) { sb.Append("*2\r\n"); sb.Append($"${k.Length}\r\n{k}\r\n"); sb.Append($"*{ents.Count}\r\n"); foreach (StreamEntry e in ents) { sb.Append("*2\r\n"); sb.Append($"${e.Id.Length}\r\n{e.Id}\r\n"); sb.Append($"*{e.Fields.Count * 2}\r\n"); foreach (var f in e.Fields) { sb.Append($"${f.Key.Length}\r\n{f.Key}\r\n"); sb.Append($"${f.Value.Length}\r\n{f.Value}\r\n"); } } } return sb.ToString(); }
     }
 
     static string BuildXReadResponseFromEntries(string key, List<StreamEntry> entries)
@@ -800,11 +974,7 @@ class RedisServer
     }
 
     static bool TryParseExplicitStreamId(string id, out ulong ms, out ulong seq)
-    {
-        ms = seq = 0; if (id == "*") return false;
-        string[] p = id.Split('-');
-        return p.Length == 2 && ulong.TryParse(p[0], out ms) && ulong.TryParse(p[1], out seq);
-    }
+    { ms = seq = 0; if (id == "*") return false; string[] p = id.Split('-'); return p.Length == 2 && ulong.TryParse(p[0], out ms) && ulong.TryParse(p[1], out seq); }
 
     static bool TryParseStreamRangeBound(string input, bool isStart, out string norm)
     {
@@ -826,11 +996,7 @@ class RedisServer
     }
 
     static int CompareStreamIds(string left, string right)
-    {
-        string[] l = left.Split('-'), r = right.Split('-');
-        int c = ulong.Parse(l[0]).CompareTo(ulong.Parse(r[0]));
-        return c != 0 ? c : ulong.Parse(l[1]).CompareTo(ulong.Parse(r[1]));
-    }
+    { string[] l = left.Split('-'), r = right.Split('-'); int c = ulong.Parse(l[0]).CompareTo(ulong.Parse(r[0])); return c != 0 ? c : ulong.Parse(l[1]).CompareTo(ulong.Parse(r[1])); }
 
     static void ServeBlockedClientsFromList(string key)
     {
