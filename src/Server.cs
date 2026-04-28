@@ -545,6 +545,10 @@ class RedisServer
             case "ZRANGE": return HandleZRange(args);
             case "ZCARD": return HandleZCard(args);
             case "ZREM": return HandleZRem(args);
+            case "GEOADD": return HandleGeoadd(args);
+            case "GEOPOS": return HandleGeopos(args);
+            case "GEODIST": return HandleGeodist(args);
+            case "GEOSEARCH": return HandleGeosearch(args);
             default: return "-ERR unknown command\r\n";
         }
     }
@@ -844,6 +848,368 @@ class RedisServer
         }
 
         return $":{removedCount}\r\n";
+    }
+
+    // ── Geohashing helpers for GEOADD ────────────────────────────────────────
+    // These methods implement the geohashing algorithm to convert latitude and
+    // longitude to a 52-bit score for storage in sorted sets.
+
+    // Spreads a 32-bit integer to 64-bit by inserting 32 zero bits in-between
+    static long SpreadInt32ToInt64(int v)
+    {
+        long result = v & 0xFFFFFFFF;
+        result = (result | (result << 16)) & 0x0000FFFF0000FFFFL;
+        result = (result | (result << 8)) & 0x00FF00FF00FF00FFL;
+        result = (result | (result << 4)) & 0x0F0F0F0F0F0F0F0FL;
+        result = (result | (result << 2)) & 0x3333333333333333L;
+        result = (result | (result << 1)) & 0x5555555555555555L;
+        return result;
+    }
+
+    // Interleaves the bits of latitude and longitude to create a 52-bit score
+    static long Interleave(int latitude, int longitude)
+    {
+        long spreadLat = SpreadInt32ToInt64(latitude);
+        long spreadLon = SpreadInt32ToInt64(longitude);
+        long lonShifted = spreadLon << 1;
+        return spreadLat | lonShifted;
+    }
+
+    // Encodes latitude and longitude to a geohash score
+    static long EncodeGeohash(double latitude, double longitude)
+    {
+        const double MinLatitude = -85.05112878;
+        const double MaxLatitude = 85.05112878;
+        const double MinLongitude = -180.0;
+        const double MaxLongitude = 180.0;
+        const double LatitudeRange = MaxLatitude - MinLatitude;
+        const double LongitudeRange = MaxLongitude - MinLongitude;
+
+        // Normalize to [0, 2^26) range
+        double normalizedLatitude = Math.Pow(2, 26) * (latitude - MinLatitude) / LatitudeRange;
+        double normalizedLongitude = Math.Pow(2, 26) * (longitude - MinLongitude) / LongitudeRange;
+
+        // Truncate to integers
+        int normalizedLatitudeInt = (int)normalizedLatitude;
+        int normalizedLongitudeInt = (int)normalizedLongitude;
+
+        return Interleave(normalizedLatitudeInt, normalizedLongitudeInt);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Geohashing decoder - reverses the encoding process
+
+    // Compacts a 64-bit integer back to 32-bit by removing interleaved zeros
+    static int CompactInt64ToInt32(long v)
+    {
+        v = v & 0x5555555555555555L;
+        v = (v | (v >> 1)) & 0x3333333333333333L;
+        v = (v | (v >> 2)) & 0x0F0F0F0F0F0F0F0FL;
+        v = (v | (v >> 4)) & 0x00FF00FF00FF00FFL;
+        v = (v | (v >> 8)) & 0x0000FFFF0000FFFFL;
+        v = (v | (v >> 16)) & 0x00000000FFFFFFFFL;
+        return (int)v;
+    }
+
+    // Converts grid numbers (latitude and longitude as 26-bit integers) back to geographic coordinates
+    static (double latitude, double longitude) ConvertGridNumbersToCoordinates(int latGrid, int lonGrid)
+    {
+        const double MinLatitude = -85.05112878;
+        const double MaxLatitude = 85.05112878;
+        const double MinLongitude = -180.0;
+        const double MaxLongitude = 180.0;
+        const double LatitudeRange = MaxLatitude - MinLatitude;
+        const double LongitudeRange = MaxLongitude - MinLongitude;
+        double GridSize = Math.Pow(2, 26);  // 26 bits for each coordinate
+
+        // Convert grid numbers to [0, 1) range, then scale to coordinate range
+        double latNormalized = (latGrid + 0.5) / GridSize;  // +0.5 to get center of cell
+        double lonNormalized = (lonGrid + 0.5) / GridSize;  // +0.5 to get center of cell
+
+        double latitude = MinLatitude + latNormalized * LatitudeRange;
+        double longitude = MinLongitude + lonNormalized * LongitudeRange;
+
+        return (latitude, longitude);
+    }
+
+    // Decodes a geohash score back to (latitude, longitude)
+    static (double latitude, double longitude) DecodeGeohash(long score)
+    {
+        // Extract the odd bits (latitude) and even bits (longitude)
+        long latBits = score & 0x5555555555555555L;  // Odd positions
+        long lonBits = (score >> 1) & 0x5555555555555555L;  // Even positions
+
+        // Compact back to 32-bit integers
+        int latGrid = CompactInt64ToInt32(latBits);
+        int lonGrid = CompactInt64ToInt32(lonBits);
+
+        return ConvertGridNumbersToCoordinates(latGrid, lonGrid);
+    }
+
+    static string HandleGeoadd(List<string> args)
+    {
+        // GEOADD key longitude latitude member [longitude latitude member ...]
+        if (args.Count < 5) return "-ERR wrong number of arguments for 'GEOADD'\r\n";
+
+        // Validate that we have an odd number of location triplets after the key
+        // args[0] = "GEOADD", args[1] = key, then triplets of (longitude, latitude, member)
+        if ((args.Count - 2) % 3 != 0) return "-ERR syntax error\r\n";
+
+        // Validate all longitude/latitude pairs
+        const double MaxLatitude = 85.05112878;
+        const double MinLatitude = -85.05112878;
+        const double MaxLongitude = 180.0;
+        const double MinLongitude = -180.0;
+
+        // Validate each triplet of (longitude, latitude, member)
+        for (int i = 2; i < args.Count; i += 3)
+        {
+            if (!double.TryParse(args[i], out double longitude))
+                return "-ERR longitude is not a valid double\r\n";
+
+            if (!double.TryParse(args[i + 1], out double latitude))
+                return "-ERR latitude is not a valid double\r\n";
+
+            // Check longitude range: -180 to +180
+            if (longitude < MinLongitude || longitude > MaxLongitude)
+                return $"-ERR invalid longitude,latitude pair {longitude},{args[i + 1]}\r\n";
+
+            // Check latitude range: -85.05112878 to +85.05112878
+            if (latitude < MinLatitude || latitude > MaxLatitude)
+                return $"-ERR invalid longitude,latitude pair {args[i]},{latitude}\r\n";
+        }
+
+        // All validations passed, now store the locations in the sorted set
+        string key = args[1];
+        int addedCount = 0;
+
+        lock (sortedSetLock)
+        {
+            if (!sortedSets.ContainsKey(key))
+                sortedSets[key] = new Dictionary<string, double>();
+
+            var members = sortedSets[key];
+
+            // Add each location with calculated geohash score
+            for (int i = 2; i < args.Count; i += 3)
+            {
+                double latitude = double.Parse(args[i + 1]);
+                double longitude = double.Parse(args[i]);
+                string member = args[i + 2];
+                double score = (double)EncodeGeohash(latitude, longitude);
+
+                if (!members.ContainsKey(member))
+                    addedCount++;
+
+                members[member] = score;
+            }
+        }
+
+        return $":{addedCount}\r\n";
+    }
+
+    static string HandleGeopos(List<string> args)
+    {
+        // GEOPOS key member [member ...]
+        if (args.Count < 3) return "-ERR wrong number of arguments for 'GEOPOS'\r\n";
+
+        string key = args[1];
+        StringBuilder sb = new StringBuilder();
+
+        // Build response array with one entry per requested member
+        int memberCount = args.Count - 2;
+        sb.Append($"*{memberCount}\r\n");
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+            {
+                // Key doesn't exist, return null arrays for all members
+                for (int i = 0; i < memberCount; i++)
+                    sb.Append("*-1\r\n");
+            }
+            else
+            {
+                // Key exists, check each member
+                for (int i = 2; i < args.Count; i++)
+                {
+                    string member = args[i];
+                    if (members.TryGetValue(member, out double score))
+                    {
+                        // Member exists, decode the geohash score to get coordinates
+                        var (latitude, longitude) = DecodeGeohash((long)score);
+
+                        // Format as bulk strings using InvariantCulture for consistent decimal representation
+                        string lonStr = longitude.ToString("G", CultureInfo.InvariantCulture);
+                        string latStr = latitude.ToString("G", CultureInfo.InvariantCulture);
+
+                        sb.Append("*2\r\n");
+                        sb.Append($"${lonStr.Length}\r\n{lonStr}\r\n");  // longitude
+                        sb.Append($"${latStr.Length}\r\n{latStr}\r\n");  // latitude
+                    }
+                    else
+                    {
+                        // Member doesn't exist, return null array
+                        sb.Append("*-1\r\n");
+                    }
+                }
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    // Haversine formula to calculate distance between two geographic points
+    static double CalculateHaversineDistance(double lat1, double lon1, double lat2, double lon2)
+    {
+        const double EarthRadiusMeters = 6372797.560856;  // Earth's radius in meters (Redis value)
+
+        // Convert degrees to radians
+        double lat1Rad = lat1 * Math.PI / 180.0;
+        double lat2Rad = lat2 * Math.PI / 180.0;
+        double deltaLatRad = (lat2 - lat1) * Math.PI / 180.0;
+        double deltaLonRad = (lon2 - lon1) * Math.PI / 180.0;
+
+        // Haversine formula
+        double a = Math.Sin(deltaLatRad / 2.0) * Math.Sin(deltaLatRad / 2.0) +
+                   Math.Cos(lat1Rad) * Math.Cos(lat2Rad) *
+                   Math.Sin(deltaLonRad / 2.0) * Math.Sin(deltaLonRad / 2.0);
+
+        double c = 2.0 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1.0 - a));
+        double distance = EarthRadiusMeters * c;
+
+        return distance;
+    }
+
+    static string HandleGeodist(List<string> args)
+    {
+        // GEODIST key member1 member2 [M|KM|FT|MI]
+        if (args.Count < 4 || args.Count > 5) return "-ERR wrong number of arguments for 'GEODIST'\r\n";
+
+        string key = args[1];
+        string member1 = args[2];
+        string member2 = args[3];
+
+        // Default unit is meters, can be specified as M, KM, FT, MI
+        string unit = "m";  // meters
+        if (args.Count == 5)
+        {
+            unit = args[4].ToLowerInvariant();
+            if (unit != "m" && unit != "km" && unit != "ft" && unit != "mi")
+                return "-ERR unsupported unit provided. please use M, KM, FT, MI\r\n";
+        }
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+                return "$-1\r\n";  // Key doesn't exist
+
+            // Check if both members exist
+            if (!members.TryGetValue(member1, out double score1) || !members.TryGetValue(member2, out double score2))
+                return "$-1\r\n";  // At least one member doesn't exist
+
+            // Decode both scores to coordinates
+            var (lat1, lon1) = DecodeGeohash((long)score1);
+            var (lat2, lon2) = DecodeGeohash((long)score2);
+
+            // Calculate distance in meters
+            double distanceMeters = CalculateHaversineDistance(lat1, lon1, lat2, lon2);
+
+            // Convert to requested unit if necessary
+            double distance = unit switch
+            {
+                "m" => distanceMeters,
+                "km" => distanceMeters / 1000.0,
+                "ft" => distanceMeters * 3.28084,
+                "mi" => distanceMeters / 1609.344,
+                _ => distanceMeters
+            };
+
+            // Format distance with proper precision
+            string distanceStr = distance.ToString("F4", CultureInfo.InvariantCulture);
+
+            // Return as RESP bulk string
+            return $"${distanceStr.Length}\r\n{distanceStr}\r\n";
+        }
+    }
+
+    static string HandleGeosearch(List<string> args)
+    {
+        // GEOSEARCH key FROMLONLAT <longitude> <latitude> BYRADIUS <radius> <unit>
+        if (args.Count < 8) return "-ERR wrong number of arguments for 'GEOSEARCH'\r\n";
+
+        string key = args[1];
+
+        // Parse FROMLONLAT option
+        if (!args[2].Equals("FROMLONLAT", StringComparison.OrdinalIgnoreCase))
+            return "-ERR syntax error\r\n";
+
+        if (!double.TryParse(args[3], NumberStyles.Float, CultureInfo.InvariantCulture, out double centerLon))
+            return "-ERR longitude is not a valid double\r\n";
+
+        if (!double.TryParse(args[4], NumberStyles.Float, CultureInfo.InvariantCulture, out double centerLat))
+            return "-ERR latitude is not a valid double\r\n";
+
+        // Parse BYRADIUS option
+        if (!args[5].Equals("BYRADIUS", StringComparison.OrdinalIgnoreCase))
+            return "-ERR syntax error\r\n";
+
+        if (!double.TryParse(args[6], NumberStyles.Float, CultureInfo.InvariantCulture, out double radius))
+            return "-ERR radius is not a valid double\r\n";
+
+        if (radius < 0) return "-ERR radius must be non-negative\r\n";
+
+        string unit = args[7].ToLowerInvariant();
+        if (unit != "m" && unit != "km" && unit != "ft" && unit != "mi")
+            return "-ERR unsupported unit provided. please use M, KM, FT, MI\r\n";
+
+        // Convert radius to meters
+        double radiusMeters = unit switch
+        {
+            "m" => radius, // Convert to meters
+            "km" => radius * 1000.0, // Convert to kilometers
+            "ft" => radius / 3.28084, // Convert to foot
+            "mi" => radius * 1609.344, // Convert to mile
+            _ => radius
+        };
+
+        List<string> results = new List<string>();
+
+        lock (sortedSetLock)
+        {
+            // Check if key exists
+            if (!sortedSets.TryGetValue(key, out var members))
+                return "*0\r\n";  // Empty array if key doesn't exist
+
+            // Iterate through all members and check distance
+            foreach (var kvp in members)
+            {
+                string member = kvp.Key;
+                double score = kvp.Value;
+
+                // Decode geohash score to coordinates
+                var (memberLat, memberLon) = DecodeGeohash((long)score);
+
+                // Calculate distance from center point
+                double distance = CalculateHaversineDistance(centerLat, centerLon, memberLat, memberLon);
+
+                // If within radius, add to results
+                if (distance <= radiusMeters)
+                    results.Add(member);
+            }
+        }
+
+        // Build RESP array response
+        StringBuilder sb = new StringBuilder();
+        sb.Append($"*{results.Count}\r\n");
+        foreach (string member in results)
+        {
+            sb.Append($"${member.Length}\r\n{member}\r\n");
+        }
+
+        return sb.ToString();
     }
 
     static string HandleRPush(List<string> args)
