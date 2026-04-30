@@ -14,6 +14,10 @@ class RedisServer
     static int replicaPort = 0;
     static string configDir = string.Empty;
     static string configDbfilename = string.Empty;
+    static string appendonly = "no";
+    static string appenddirname = "appendonlydir";
+    static string appendfilename = "appendonly.aof";
+    static string appendfsync = "everysec";
     static TcpClient? masterClient;
     static NetworkStream? masterStream;
     static readonly string masterReplId = GenerateReplicationId();
@@ -582,9 +586,54 @@ class RedisServer
             {
                 configDbfilename = args[++i];
             }
+            else if (args[i] == "--appendonly" && i + 1 < args.Length)
+            {
+                appendonly = args[++i];
+            }
+            else if (args[i] == "--appenddirname" && i + 1 < args.Length)
+            {
+                appenddirname = args[++i];
+            }
+            else if (args[i] == "--appendfilename" && i + 1 < args.Length)
+            {
+                appendfilename = args[++i];
+            }
+            else if (args[i] == "--appendfsync" && i + 1 < args.Length)
+            {
+                appendfsync = args[++i];
+            }
+        }
+
+        // Initialize configDir to current working directory if not provided
+        if (string.IsNullOrEmpty(configDir))
+        {
+            configDir = Directory.GetCurrentDirectory();
+        }
+
+        // Create append-only directory if AOF is enabled
+        if (appendonly.Equals("yes", StringComparison.OrdinalIgnoreCase))
+        {
+            string appendDir = Path.Combine(configDir, appenddirname);
+            Directory.CreateDirectory(appendDir);
+
+            // Create empty append-only file
+            string appendFilePath = Path.Combine(appendDir, $"{appendfilename}.1.incr.aof");
+            if (!File.Exists(appendFilePath))
+            {
+                File.Create(appendFilePath).Dispose();
+            }
+
+            // Create manifest file
+            string manifestPath = Path.Combine(appendDir, $"{appendfilename}.manifest");
+            if (!File.Exists(manifestPath))
+            {
+                string manifestContent = $"file {appendfilename}.1.incr.aof seq 1 type i\n";
+                File.WriteAllText(manifestPath, manifestContent);
+            }
         }
 
         LoadRdbFile();
+        ReplayAofFile();
         if (isReplica) ConnectToMaster(replicaHost, replicaPort, port);
         TcpListener server = new TcpListener(IPAddress.Any, port);
         server.Start();
@@ -797,6 +846,7 @@ class RedisServer
                     {
                         state.InTransaction = false;
                         state.QueuedCommands.Clear();
+                        state.WatchedKeys.Clear();
                         response = "+OK\r\n";
                     }
                 }
@@ -827,6 +877,19 @@ class RedisServer
                         {
                             response = "-ERR wrong number of arguments for 'WATCH'\r\n";
                         }
+                    }
+                }
+                else if (command == "UNWATCH")
+                {
+                    if (state.InTransaction)
+                    {
+                        response = "-ERR UNWATCH inside MULTI is not allowed\r\n";
+                    }
+                    else
+                    {
+                        // Clear all watched keys for this connection
+                        state.WatchedKeys.Clear();
+                        response = "+OK\r\n";
                     }
                 }
                 else if (state.InTransaction)
@@ -1065,6 +1128,9 @@ class RedisServer
             keyVersions[key] = ++globalVersion;
         }
 
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
+
         return "+OK\r\n";
     }
 
@@ -1269,6 +1335,12 @@ class RedisServer
             if (p == "dir") return $"*2\r\n$3\r\ndir\r\n${configDir.Length}\r\n{configDir}\r\n";
             if (p == "dbfilename")
                 return $"*2\r\n$10\r\ndbfilename\r\n${configDbfilename.Length}\r\n{configDbfilename}\r\n";
+            if (p == "appendonly") return $"*2\r\n$10\r\nappendonly\r\n${appendonly.Length}\r\n{appendonly}\r\n";
+            if (p == "appenddirname")
+                return $"*2\r\n$13\r\nappenddirname\r\n${appenddirname.Length}\r\n{appenddirname}\r\n";
+            if (p == "appendfilename")
+                return $"*2\r\n$14\r\nappendfilename\r\n${appendfilename.Length}\r\n{appendfilename}\r\n";
+            if (p == "appendfsync") return $"*2\r\n$11\r\nappendfsync\r\n${appendfsync.Length}\r\n{appendfsync}\r\n";
             return "*0\r\n";
         }
 
@@ -1350,6 +1422,9 @@ class RedisServer
                     keyVersions[key] = ++globalVersion;
                 }
 
+                // Append to AOF file before responding
+                AppendCommandToAof(args);
+
                 return ":1\r\n";
             }
 
@@ -1360,6 +1435,9 @@ class RedisServer
                 keyVersions[key] = ++globalVersion;
             }
 
+            // Append to AOF file before responding
+            AppendCommandToAof(args);
+
             return $":{cur + 1}\r\n";
         }
 
@@ -1368,6 +1446,9 @@ class RedisServer
         {
             keyVersions[key] = ++globalVersion;
         }
+
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
 
         return ":1\r\n";
     }
@@ -1437,6 +1518,9 @@ class RedisServer
                 members[member] = score;
             }
         }
+
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
 
         return $":{newMembersAdded}\r\n";
     }
@@ -1579,6 +1663,9 @@ class RedisServer
             // If the set is now empty, remove the key entirely
             if (members.Count == 0) sortedSets.Remove(key);
         }
+
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
 
         return $":{removedCount}\r\n";
     }
@@ -1733,6 +1820,9 @@ class RedisServer
                 members[member] = score;
             }
         }
+
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
 
         return $":{addedCount}\r\n";
     }
@@ -1951,6 +2041,9 @@ class RedisServer
             }
         }
 
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
+
         return $":{n}\r\n";
     }
 
@@ -1970,6 +2063,9 @@ class RedisServer
                 keyVersions[args[1]] = ++globalVersion;
             }
         }
+
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
 
         return $":{n}\r\n";
     }
@@ -2028,6 +2124,9 @@ class RedisServer
                     keyVersions[key] = ++globalVersion;
                 }
 
+                // Append to AOF file before responding
+                AppendCommandToAof(args);
+
                 return $"${v.Length}\r\n{v}\r\n";
             }
         }
@@ -2051,6 +2150,9 @@ class RedisServer
             {
                 keyVersions[key] = ++globalVersion;
             }
+
+            // Append to AOF file before responding
+            AppendCommandToAof(args);
 
             return sb.ToString();
         }
@@ -2163,6 +2265,9 @@ class RedisServer
                 ServeBlockedXReadClients(key, entries);
             }
 
+            // Append to AOF file before responding
+            AppendCommandToAof(args);
+
             return $"${finalId.Length}\r\n{finalId}\r\n";
         }
 
@@ -2198,6 +2303,9 @@ class RedisServer
                 ServeBlockedXReadClients(key, entries);
             }
 
+            // Append to AOF file before responding
+            AppendCommandToAof(args);
+
             return $"${finalId.Length}\r\n{finalId}\r\n";
         }
 
@@ -2220,6 +2328,9 @@ class RedisServer
             entries.Add(e);
             ServeBlockedXReadClients(key, entries);
         }
+
+        // Append to AOF file before responding
+        AppendCommandToAof(args);
 
         return $"${finalId.Length}\r\n{finalId}\r\n";
     }
@@ -2552,5 +2663,112 @@ class RedisServer
         }
 
         return args;
+    }
+
+    // Read the AOF manifest and return the path to the active incremental AOF file
+    static string? GetActiveAofFile()
+    {
+        if (appendonly != "yes") return null;
+
+        string appendDir = Path.Combine(configDir, appenddirname);
+        string manifestPath = Path.Combine(appendDir, $"{appendfilename}.manifest");
+
+        if (!File.Exists(manifestPath)) return null;
+
+        try
+        {
+            string manifestContent = File.ReadAllText(manifestPath);
+            // Expected format: file <filename> seq <seq> type i
+            string[] parts = manifestContent.Trim().Split(' ');
+            if (parts.Length >= 2 && parts[0] == "file")
+            {
+                return Path.Combine(appendDir, parts[1]);
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
+    // Append a command to the AOF file in RESP format
+    static void AppendCommandToAof(List<string> args)
+    {
+        if (appendonly != "yes") return;
+
+        string? aofPath = GetActiveAofFile();
+        if (aofPath == null) return;
+
+        try
+        {
+            // Convert command to RESP format
+            StringBuilder respBuilder = new StringBuilder();
+            respBuilder.Append($"*{args.Count}\r\n");
+            foreach (string arg in args)
+            {
+                respBuilder.Append($"${arg.Length}\r\n{arg}\r\n");
+            }
+
+            // Append to AOF file
+            File.AppendAllText(aofPath, respBuilder.ToString());
+
+            // Flush to disk if appendfsync is "always"
+            if (appendfsync == "always")
+            {
+                using (FileStream fs = new FileStream(aofPath, FileMode.Open, FileAccess.Write))
+                {
+                    fs.Flush();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error writing to AOF file: {ex.Message}");
+        }
+    }
+
+    // Replay commands from the AOF file on startup
+    static void ReplayAofFile()
+    {
+        if (appendonly != "yes") return;
+
+        string? aofPath = GetActiveAofFile();
+        if (aofPath == null || !File.Exists(aofPath)) return;
+
+        try
+        {
+            // Read the entire AOF file
+            byte[] fileBytes = File.ReadAllBytes(aofPath);
+            List<byte> buf = new List<byte>(fileBytes);
+
+            // Parse and replay each RESP command
+            int consumed = 0;
+            while (consumed < buf.Count)
+            {
+                // Try to parse a RESP array from the buffer
+                List<byte> remaining = new List<byte>(buf.GetRange(consumed, buf.Count - consumed));
+                if (!TryParseRespArray(remaining, out List<string> cmdArgs, out int cmdConsumed))
+                {
+                    // No more complete commands to parse
+                    break;
+                }
+
+                if (cmdArgs.Count > 0)
+                {
+                    // Execute the command
+                    string command = cmdArgs[0].ToUpperInvariant();
+                    DispatchCommand(command, cmdArgs);
+                }
+
+                consumed += cmdConsumed;
+            }
+
+            Console.WriteLine("AOF replay completed.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error replaying AOF file: {ex.Message}");
+        }
     }
 }
