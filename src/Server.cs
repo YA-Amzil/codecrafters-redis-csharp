@@ -1055,6 +1055,8 @@ class RedisServer
                 return HandleGet(args);
             case "SETBIT":
                 return HandleSetBit(args);
+            case "GETBIT":
+                return HandleGetBit(args);
             case "INFO":
                 return HandleInfo(args);
             case "INCR":
@@ -1203,6 +1205,32 @@ class RedisServer
         AppendCommandToAof(args);
 
         return $":{originalBit}\r\n";
+    }
+
+    static string HandleGetBit(List<string> args)
+    {
+        if (args.Count != 3) return "-ERR wrong number of arguments for 'GETBIT'\r\n";
+        string key = args[1];
+
+        if (!int.TryParse(args[2], out int offset) || offset < 0)
+            return "-ERR bit offset is not an integer or out of range\r\n";
+
+        if (!store.TryGetValue(key, out var existing))
+            return ":0\r\n";
+
+        var (v, ex) = existing;
+        if (ex.HasValue && DateTime.UtcNow > ex.Value)
+            return ":0\r\n";
+
+        int byteIndex = offset / 8;
+        if (byteIndex >= v.Length)
+            return ":0\r\n";
+
+        int bitIndexInByte = 7 - (offset % 8);
+        int mask = 1 << bitIndexInByte;
+        int bit = (v[byteIndex] & mask) != 0 ? 1 : 0;
+
+        return $":{bit}\r\n";
     }
 
     static string HandleInfo(List<string> args)
