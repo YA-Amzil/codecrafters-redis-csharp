@@ -1053,6 +1053,8 @@ class RedisServer
                 return HandleSet(args);
             case "GET":
                 return HandleGet(args);
+            case "SETBIT":
+                return HandleSetBit(args);
             case "INFO":
                 return HandleInfo(args);
             case "INCR":
@@ -1150,6 +1152,57 @@ class RedisServer
         }
 
         return "$-1\r\n";
+    }
+
+    static string HandleSetBit(List<string> args)
+    {
+        if (args.Count != 4) return "-ERR wrong number of arguments for 'SETBIT'\r\n";
+        string key = args[1];
+
+        if (!int.TryParse(args[2], out int offset) || offset < 0)
+            return "-ERR bit offset is not an integer or out of range\r\n";
+        if (!int.TryParse(args[3], out int bitValue) || (bitValue != 0 && bitValue != 1))
+            return "-ERR bit is not an integer or out of range\r\n";
+
+        string value = string.Empty;
+        DateTime? expiry = null;
+        if (store.TryGetValue(key, out var existing))
+        {
+            var (v, ex) = existing;
+            if (!ex.HasValue || DateTime.UtcNow <= ex.Value)
+            {
+                value = v;
+                expiry = ex;
+            }
+        }
+
+        int byteIndex = offset / 8;
+        int bitIndexInByte = 7 - (offset % 8);
+
+        char[] chars = value.ToCharArray();
+        if (byteIndex >= chars.Length)
+        {
+            Array.Resize(ref chars, byteIndex + 1);
+        }
+
+        int mask = 1 << bitIndexInByte;
+        int originalBit = (chars[byteIndex] & mask) != 0 ? 1 : 0;
+
+        if (bitValue == 1)
+            chars[byteIndex] = (char)(chars[byteIndex] | mask);
+        else
+            chars[byteIndex] = (char)(chars[byteIndex] & ~mask);
+
+        store[key] = (new string(chars), expiry);
+
+        lock (versionLock)
+        {
+            keyVersions[key] = ++globalVersion;
+        }
+
+        AppendCommandToAof(args);
+
+        return $":{originalBit}\r\n";
     }
 
     static string HandleInfo(List<string> args)
